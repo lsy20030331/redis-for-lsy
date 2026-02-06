@@ -18,28 +18,45 @@ public class RespUtil {
      * @return 解析成功返回解析的字节数，解析失败返回-1，需要更多数据返回0
      */
     public static int parseCommand(byte[] bytes, int offset, int length, RedisServer.RedisRequest redisRequest) {
+        // 将字节数组包装成一个缓冲区
         ByteBuffer buffer = ByteBuffer.wrap(bytes, offset, length);
         try {
+            /* TODO:
+                resp命令格式:
+                SET name tom 命令在网络中长这样： *3\r\n$3\r\nSET\r\n$4\r\nname\r\n$3\r\ntom\r\n
+                解释:
+                *3 表示参数数量(SET, name, tom)
+                $3 表示参数长度(SET)
+                SET 表示参数以此类推
+            */
+
+            // 如果三个字节都没有说明数据还没有发完返回0
             if (buffer.remaining() < 3) return 0; // 至少需要 "*1\r\n"
-
+            /*
+              TODO!: 执行buffer.get()方法会移动缓冲区的指针
+             */
+            // 如果不是'*'开头则说明数据格式错误(redis请求必须以* 开头)
             if (buffer.get() != '*') return -1; // 协议头错误
-
+            // 解析开头的数字(参数数量)
             int argCount = parseNumber(buffer); // 解析参数数量
             if (argCount <= 0) return -1;
 
-            // 新增：消费CRLF分隔符
+            // 新增：消费CRLF分隔符(如果数字后面跟的不是\r\n)则说明数据格式错误
             if (buffer.remaining() < 2 || buffer.get() != '\r' || buffer.get() != '\n') {
                 return -1;
             }
             int totalProcessed = 1 + 2; // 已处理'*'和CRLF
 
+            // 创建参数列表(初始长度为参数数量)
             List<String> args = new ArrayList<>(argCount);
 
             for (int i = 0; i < argCount; i++) {
                 if (buffer.remaining() < 3) return 0; // 需要更多数据
+                // 如果格式错误那么就返回-1
                 if (buffer.get() != '$') return -1;
                 totalProcessed++;
 
+                // 读出参数
                 int paramLen = parseNumber(buffer); // 参数长度
                 if (paramLen < 0) return -1;
 
@@ -49,9 +66,14 @@ public class RespUtil {
                 }
                 totalProcessed += 2;
 
-                if (buffer.remaining() < paramLen + 2) return 0; // 数据不完整
+                // 参数值
+                if (buffer.remaining() < paramLen + 2) return 0; // 检查剩余的长度是否满足 参数长度 + CRLF(2)的长度，如果不满足就属于数据不完整
+
                 byte[] param = new byte[paramLen];
+                // 将 buffer 中从当前 position 开始的 paramLen 个字节，拷贝到 param 数组中
+                // 拷贝完成后，buffer 的 position 指针会一次性跳过 paramLen 个位置
                 buffer.get(param);
+                // 将参数加入到list中
                 args.add(new String(param, StandardCharsets.UTF_8));
                 totalProcessed += paramLen;
 
@@ -82,6 +104,7 @@ public class RespUtil {
                 byte b = buffer.get();
                 char c = (char) b;
 
+                // 判断是否是数字
                 if (c < '0' || c > '9') {
                     buffer.position(buffer.position() - 1); // 关键回退：指针回到非数字字符（如\r）的位置
                     break;
