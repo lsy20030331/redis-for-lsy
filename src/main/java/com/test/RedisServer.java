@@ -210,10 +210,11 @@ public class RedisServer
     public static void main( String[] args ) throws IOException, InterruptedException {
         initServer();
 
-        beforeSleep();
         // 下次执行公事（例如持久化等操作）的时间
 //        long nextEventTime = System.currentTimeMillis();
+        // 事件循环event loop开始
         while(true){
+            beforeSleep();
 //            // 记录当前时间
 //            long now = System.currentTimeMillis();
 //            long timeout = 0;
@@ -855,54 +856,126 @@ public class RedisServer
         activeExpireCycle(false);
     }
 
-    // 过期键的主动删除
+    // 过期键的主动删除 新版, 更贴合redis源码
     public static void activeExpireCycle(boolean flag) {
-        /**
-         * 1. 要控制这个函数需要跑多久
-         * 2. 要控制删除的键的数量
-         */
+        // --- 1. 参数初始化 (对应 Redis 源码中的 timelimit) ---
+        // 慢模式：25ms (Redis默认值)；快模式：1ms (Redis默认值)
+        // 原本设置的 50ms/10ms 对 Redis 来说太久了，会导致明显的命令卡顿
+        long timelimit = flag ? 1 : 25; // 这里的单位我们内部逻辑处理为微秒级更精确，但此处保持毫秒逻辑
+        long start = System.currentTimeMillis();
+        long endTime = start + timelimit;
 
-        // 设置函数最多运行50ms, 删除键的数量最多为10000个
-        long endTime = System.currentTimeMillis() + 50;
-        long maxSum = 10000;
-
-        // 快模式
-        if (flag){
-            endTime = System.currentTimeMillis() + 10;
-            maxSum = 1000;
-        }
-        // 统计删除key的数量
+        // 每次随机采样的数量 (ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP)
+        int max_samples = 20;
         long sum = 0;
+        long maxSum = flag ? 100 : 1000; // 快模式更谨慎，删除量调低
 
-        for (RedisDB redisDB : redisDB){
-            // 统计key的数量
-            long dbSize = redisDB.dict.getDictSize();
-            if (dbSize == 0){
-                continue;
-            }
+        // --- 2. 数据库轮询 (避免每次都从 0 号库开始) ---
+        // 真实 Redis 会记录上一次清理到哪个 DB 了，这里我们简单处理
+        for (int i = 0; i < redisDB.length; i++) {
+            RedisDB db = redisDB[i];
 
+            // 如果过期字典为空，直接跳过
+            if (db.expires.getDictSize() == 0) continue;
 
-            for (Map.Entry<String, Long> entry : redisDB.expires.ht[0].entrySet()) {
-                String key = entry.getKey();
-                long expireTime = entry.getValue();
+            // --- 3. 核心随机抽样循环 ---
+            do {
+                // 本轮循环删除过期键的数量
+                int expired_this_loop = 0;
+                // 采样数量, 如果剩余的键数小于max_samples，则全部遍历, 所以这里取两者最小值
+                int num_to_check = Math.toIntExact(Long.valueOf(Math.min(db.expires.getDictSize(), max_samples)));
 
-                // 判断是否过期
-                if (expireTime <= System.currentTimeMillis()){
-                    RedisObject redisObject = redisDB.dict.getRedisObject(key);
-                    System.out.println("过期键主动淘汰key: " + key + " value: " + (redisObject == null ? "null" : redisObject));
+                for (int j = 0; j < num_to_check; j++) {
+                    // 重点：必须使用 getRandomKey()，禁止 entrySet()
+                    // 随机获取一个key
+                    String key = dictGetRandomKey(db.expires);
+                    if (key == null) break;
 
-                    redisDB.dict.remove(key);
-                    redisDB.expires.remove(key);
-                    sum ++;
+                    long now = System.currentTimeMillis();
+                    Long expireTime = db.expires.getTTL(key);
+
+                    if (expireTime != null && expireTime <= now) {
+                        // 记录日志会严重拖慢清理速度，建议仅在调试时开启
+                        // RedisObject redisObject = db.dict.getRedisObject(key);
+                        System.out.println("过期键的主动删除: " + key);
+                        db.dict.remove(key);
+                        db.expires.remove(key);
+                        sum++;
+                        expired_this_loop++;
+                    }
+
+                    // 检查时间限制 (每 16 次操作检查一次，减少系统调用开销)
+                    if ((sum & 15) == 0) {
+                        if (System.currentTimeMillis() >= endTime) return;
+                    }
                 }
-                // 如果过期时间到了或者删除键的数量到达最大值那么就直接返回
-                if (System.currentTimeMillis() >= endTime || sum >= maxSum){
+
+                /**
+                 * 4. 概率性退出机制 (Redis 的核心精髓)
+                 * 如果这一批次中过期的 Key 比例小于 25%，说明该 DB 中过期键密度不高。
+                 * 此时没必要继续浪费 CPU，直接跳出 do-while 去看下一个 DB。
+                 */
+                if (expired_this_loop <= max_samples / 4) {
+                    break;
+                }
+
+                // 检查数量上限和时间上限
+                if (sum >= maxSum || System.currentTimeMillis() >= endTime) {
                     return;
                 }
-            }
-        }
 
+            } while (db.expires.getDictSize() > 0);
+        }
     }
+
+    // 过期键的主动删除
+//    public static void activeExpireCycle(boolean flag) {
+//        /**
+//         * 1. 要控制这个函数需要跑多久
+//         * 2. 要控制删除的键的数量
+//         */
+//
+//        // 设置函数最多运行50ms, 删除键的数量最多为10000个
+//        long endTime = System.currentTimeMillis() + 50;
+//        long maxSum = 10000;
+//
+//        // 快模式
+//        if (flag){
+//            endTime = System.currentTimeMillis() + 10;
+//            maxSum = 1000;
+//        }
+//        // 统计删除key的数量
+//        long sum = 0;
+//
+//        for (RedisDB redisDB : redisDB){
+//            // 统计key的数量
+//            long dbSize = redisDB.dict.getDictSize();
+//            if (dbSize == 0){
+//                continue;
+//            }
+//
+//
+//            for (Map.Entry<String, Long> entry : redisDB.expires.ht[0].entrySet()) {
+//                String key = entry.getKey();
+//                long expireTime = entry.getValue();
+//
+//                // 判断是否过期
+//                if (expireTime <= System.currentTimeMillis()){
+//                    RedisObject redisObject = redisDB.dict.getRedisObject(key);
+//                    System.out.println("过期键主动淘汰key: " + key + " value: " + (redisObject == null ? "null" : redisObject));
+//
+//                    redisDB.dict.remove(key);
+//                    redisDB.expires.remove(key);
+//                    sum ++;
+//                }
+//                // 如果过期时间到了或者删除键的数量到达最大值那么就直接返回
+//                if (System.currentTimeMillis() >= endTime || sum >= maxSum){
+//                    return;
+//                }
+//            }
+//        }
+//
+//    }
 
     /**
      * 返回错误信息
