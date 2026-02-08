@@ -6,6 +6,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.List;
 
 /**
  * Hello world!
@@ -13,6 +14,18 @@ import java.util.*;
  */
 public class RedisServer
 {
+    /* Redis 内存淘汰策略 */
+    static int REDIS_MAXMEMORY_VOLATILE_LRU = 0;
+    static int REDIS_MAXMEMORY_VOLATILE_TTL = 1;
+    static int REDIS_MAXMEMORY_VOLATILE_RANDOM = 2;
+
+    static int REDIS_MAXMEMORY_ALLKEYS_LRU = 3;
+    static int REDIS_MAXMEMORY_ALLKEYS_RANDOM = 4;
+    static int REDIS_MAXMEMORY_NO_EVICTION = 5;
+    static int REDIS_DEFAULT_MAXMEMORY_POLICY = REDIS_MAXMEMORY_NO_EVICTION;
+
+    static long maxmemory = 3;//模拟最大内存大小
+    static int maxmemory_policy = REDIS_MAXMEMORY_ALLKEYS_LRU;
 
     // Redis的16个数据库实例
     static RedisDB[] redisDB;
@@ -183,41 +196,60 @@ public class RedisServer
         }
     }
 
+    // 时间事件
+    public static long eventTime = System.currentTimeMillis();
 
+    // 引入redis hz动态管理频率
+    static int hz = 10;
+
+
+    private static void beforeSleep() {
+        // 过期键的主动删除
+        activeExpireCycle(true);
+    }
     public static void main( String[] args ) throws IOException, InterruptedException {
         initServer();
 
+        beforeSleep();
         // 下次执行公事（例如持久化等操作）的时间
-        long nextEventTime = System.currentTimeMillis();
+//        long nextEventTime = System.currentTimeMillis();
         while(true){
-            // 记录当前时间
-            long now = System.currentTimeMillis();
-            long timeout = 0;
-            if (now < nextEventTime){
-                /**
-                 * 还未到达下次公事的时间
-                 * 计算：超时时间 = 下次执行公事时间 - 当前时间
-                 */
-                timeout = nextEventTime - now;
-            }else if (now > nextEventTime){
-                /**
-                 * 已经到达下次公事时间
-                 * 1. 执行公事
-                 * 2. 计算：下次公事时间 = 当前时间 + 公事间隔
-                 */
-                nextEventTime = now + 100;
-            }
+//            // 记录当前时间
+//            long now = System.currentTimeMillis();
+//            long timeout = 0;
+//            if (now < nextEventTime){
+//                /**
+//                 * 还未到达下次公事的时间
+//                 * 计算：超时时间 = 下次执行公事时间 - 当前时间
+//                 */
+//                timeout = nextEventTime - now;
+//            }else if (now > nextEventTime){
+//                /**
+//                 * 已经到达下次公事时间
+//                 * 1. 执行公事
+//                 * 2. 计算：下次公事时间 = 当前时间 + 公事间隔
+//                 */
+//                nextEventTime = now + 100;
+//            }
 
+            // 优化后的逻辑
+            long now = System.currentTimeMillis();
+            long timeout = eventTime - now;
+
+            // 防止timeout为0导致cpu空转
+            if (timeout <= 0){
+                timeout = 1;
+            }
             // 在容忍时间(timeout)里处理请求事件
             aeProcessEvents(timeout);
 
             // 当前时间比下一次处理公共事件还要大那么就处理公事
-            if (now >= nextEventTime){
+            if (now >= eventTime){
                 serverCron();
+                eventTime = now + 1000 / hz;
             }
         }
     }
-
 
 
     // 初始化redis服务
@@ -259,7 +291,7 @@ public class RedisServer
             // 将选择键从selectedKeys集合中移除，以防误重复处理
             iterator.remove();
             // 处理事件
-            System.out.println("处理事件:" + key);
+            // System.out.println("处理事件:" + key);
 
             if (key.isAcceptable()){
                 // 接收连接
@@ -324,7 +356,7 @@ public class RedisServer
         } catch (IOException e) {
             closeClient(socketChannel, key, redisClient);
         }
-        System.out.println("读取数据" +  new String(buffer.array()));
+        // System.out.println("读取数据" +  new String(buffer.array()));
 
         // 将缓冲区数据移动到queryBuf中
         redisClient.appendToQueryBuf(buffer);
@@ -448,7 +480,12 @@ public class RedisServer
                 // 更新缓冲区的长度
                 client.queryBufLen = remaining.length;
                 // 执行命令
-                Object result = doCommand(client, redisRequest);
+                Object result = null;
+                try{
+                    result = processCommand(client, redisRequest);
+                }catch (Exception e){
+                    result = new ErrorObject("Error Args or Command, Please check your Command!");
+                }
                 // 标记回复状态
                 client.returnValue = result;
                 client.write = true;
@@ -494,13 +531,169 @@ public class RedisServer
     }
 
 
-    public static Object doCommand(RedisClient redisClient, RedisRequest redisRequest) {
+    public static Object processCommand(RedisClient redisClient, RedisRequest redisRequest) {
         System.out.println("handle command: " + redisRequest.command + " args: " + redisRequest.args);
         RedisDB selectedDB = redisClient.selectDB;
+        // 为了防止连接redis client发送command命令，这里对command进行过滤
+        if("command".equalsIgnoreCase(redisRequest.command)){
+            return "OK";
+        }
+        String key = redisRequest.args.get(0);
+
+        // 内存淘汰策略
+        if (maxmemory > 0){
+            int retval = freeMemoryIfNeeded();
+            if (retval == -1 && isCmdDenyoom(redisRequest.command)){
+                // 等于-1代表失败
+                return new ErrorObject("OOM Command not allowed when used mempry > 'maxmemory'.");
+            }
+        }
+
+        return call(redisClient, redisRequest, selectedDB, key);
+    }
+
+    private static int freeMemoryIfNeeded() {
+        long dbSize = getDbSize();
+        if (dbSize < maxmemory){
+            // 内存充足
+            return 0;
+        }
+
+        // 内存不足并且内存淘汰策略是 noeviction的情况下直接返回-1抛出异常
+        if (maxmemory_policy == REDIS_MAXMEMORY_NO_EVICTION){
+            return -1;
+        }
+
+        // 计算要淘汰多少内存
+        long mem_toFree = dbSize - maxmemory;
+        // 已经释放的内存
+        int mem_freed = 0;
 
 
+
+        while (mem_freed < mem_toFree){
+            // 是否有过期键删除
+            boolean key_freed = false;
+            for (int i = 0; i < redisDB.length; i ++){
+                // 目标字典
+                Dict targetDic = null;
+                // 要删除的键
+                String deleteKey = null;
+
+                // 根据内存淘汰策略的不同来选择目标字典
+                if (maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU || maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM){
+                    targetDic = redisDB[i].dict;
+                }else {
+                    targetDic = redisDB[i].expires;
+                }
+
+                if (targetDic.getDictSize() == 0){
+                    continue;
+                }
+
+                // Random策略
+                if (maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM || maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_RANDOM){
+                    deleteKey = dictGetRandomKey(targetDic);
+                }
+                // LRU策略
+                if (maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU || maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU){
+                    // 从一批sample中选取IDEL最长的key
+                    int sampleCount = 5; // 采样数量
+                    String bestKey = null; // 最佳键
+                    long maxIDEL = -1;  // 最大IDEL(
+                    for (int j = 0; j < sampleCount; j ++){
+                        String key = dictGetRandomKey(targetDic);
+                        if (key == null){
+                            continue;
+                        }
+
+                        Long idel = redisDB[i].dict.getIDLE(key);
+                        // 找到IDEL最大的key
+                        if (idel > maxIDEL){
+                            maxIDEL = idel;
+                            bestKey = key;
+                        }
+                    }
+                    // 将bestKey赋值给deleteKey
+                    if (bestKey != null){
+                        deleteKey = bestKey;
+                    }
+                }
+                // TTL策略
+                if (maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_TTL){
+                    // 随机从5个key中选取一个最小ttl的key, 并不是把所有的键的ttl进行排序
+                    int sampleCount = 5;
+                    String tempKey = null;
+                    long tempTTL = Long.MAX_VALUE;
+                    for (int j = 0; j < sampleCount; j ++){
+                        String randomKey = dictGetRandomKey(targetDic);
+                        long ttl = redisDB[i].expires.getTTL(randomKey);
+                        if (ttl < tempTTL){
+                            tempTTL = ttl;
+                            tempKey = randomKey;
+                        }
+                    }
+                    deleteKey = tempKey;
+                }
+
+                if (deleteKey != null){
+                    System.out.println("内存淘汰,策略: " + maxmemory_policy + " 删除key: " + deleteKey);
+                    // 删除key
+                    key_freed = true;
+                    redisDB[i].dict.remove(deleteKey);
+                    redisDB[i].expires.remove(deleteKey);
+                    mem_freed += 1;
+                }
+
+            }
+
+            if (!key_freed){
+                // 如果循环结束了, 但是没有满足策略的key
+                return -1;
+            }
+        }
+
+
+        return mem_freed;
+    }
+
+    // 随机获取一个key
+    public static String dictGetRandomKey(Dict dict) {
+        if (dict.getDictSize() == 0){
+            return null;
+        }
+        List<String> keysArray = new ArrayList<>();
+
+        if (dict.rehash == -1){
+            // 如果没有正在进行渐进式哈希那么就直接使用h[0]
+            keysArray = new ArrayList<>(dict.ht[0].keySet());
+        }else {
+            // 如果正在进行渐进式哈希那么就使用h[0]+h[1]
+            keysArray = new ArrayList<>(dict.ht[0].keySet());
+            List<String> keysArray1 = new ArrayList<>(dict.ht[1].keySet());
+            keysArray.addAll(keysArray1);
+        }
+
+        Random random = new Random();
+        int index = random.nextInt(keysArray.size());
+        return keysArray.get(index);
+    }
+
+    static long getDbSize(){
+        long size = 0;
+        for (int i = 0; i < redisDB.length; i ++ ){
+            size += redisDB[i].dict.getDictSize();
+        }
+        return size;
+    }
+
+    public static boolean isCmdDenyoom(String command) {
+        return "set".equalsIgnoreCase(command) || "setnx".equalsIgnoreCase(command);
+    }
+
+    private static Object call(RedisClient redisClient, RedisRequest redisRequest, RedisDB selectedDB, String key) {
         if ("get".equalsIgnoreCase(redisRequest.command)){
-            String key = redisRequest.args.get(0);
+            // String key = redisRequest.args.get(0);
             return lookUpKeyRead(selectedDB, key);
         }
         if("set".equalsIgnoreCase(redisRequest.command)){
@@ -519,7 +712,7 @@ public class RedisServer
             return "OK";
         }
         if ("expire".equalsIgnoreCase(redisRequest.command)){
-            String key = redisRequest.args.get(0);
+            // String key = redisRequest.args.get(0);
             // 如果key不存在那么就返回0
             RedisObject object = selectedDB.dict.getRedisObject(key);
             if (object == null){
@@ -542,10 +735,95 @@ public class RedisServer
             return infoResponse;
         }
         if ("hello".equalsIgnoreCase(redisRequest.command)){
-            ErrorObject errorObject = new RedisServer.ErrorObject("ERR unknown command '" + redisRequest.command + "'");
+            ErrorObject errorObject = new ErrorObject("ERR unknown command '" + redisRequest.command + "'");
             return errorObject;
         }
+        if ("ttl".equalsIgnoreCase(redisRequest.command)){
+            Long ttl = selectedDB.expires.getTTL(key);
+            if (ttl == null){
+                return -1;
+            }
+            long l = (ttl - System.currentTimeMillis()) / 1000;
+            return Long.valueOf(l);
+        }
+        if ("keys".equalsIgnoreCase(redisRequest.command)){
+            String pattern = redisRequest.args.get(0);  // keys pattern中的pattrn参数
+            List<String> keys = new ArrayList<>();
+
+            for (RedisDB redisDb : redisDB){
+                // 判断是否过期
+                for (String getKey : redisDb.dict.ht[0].keySet()){
+                    if (redisDb.expires.ht[0].get(getKey) != null){
+                        // 如果过期了那么就不加入到list中
+                        if (redisDb.expires.getTTL(getKey) - System.currentTimeMillis() < 0){
+                            continue;
+                        }
+                    }
+                    // System.out.println(redisDb.expires.getTTL(getKey));
+                    if (isMatch(getKey, pattern)){
+                        keys.add(getKey);
+                    }
+                }
+                if (redisDb.dict.rehash != -1){
+                    for (String getKey : redisDb.dict.ht[1].keySet()){
+                        if (redisDb.expires.ht[1].get(getKey) != null){
+                            // 如果过期了那么就不加入到list中
+                            if (redisDb.expires.getTTL(getKey) - System.currentTimeMillis() < 0){
+                                continue;
+                            }
+                        }
+                        if (isMatch(getKey, pattern)){
+                            keys.add(getKey);
+                        }
+                    }
+                }
+            }
+            return keys.toString();
+        }
         return "ERR unknown command '" + redisRequest.command + "'";
+    }
+
+    public static boolean isMatch(String s, String p) {
+        int sLen = s.length();
+        int pLen = p.length();
+
+        // dp[i][j] 表示：s 的前 i 个字符是否与 p 的前 j 个字符匹配
+        boolean[][] dp = new boolean[sLen + 1][pLen + 1];
+
+        // 基础情况：两个空字符串匹配
+        dp[0][0] = true;
+
+        // 处理模式p开头是连续*的情况：*可以匹配空字符串
+        for (int j = 1; j <= pLen; j++) {
+            if (p.charAt(j - 1) == '*') {
+                dp[0][j] = dp[0][j - 1]; // 当前状态依赖于前一个状态
+            } else {
+                // 遇到非'*'字符，后续不可能再匹配空字符串，直接跳出循环
+                break;
+            }
+        }
+        // 填充dp数组
+        for (int i = 1; i <= sLen; i++) {
+            for (int j = 1; j <= pLen; j++) {
+                char charOfP = p.charAt(j - 1);
+
+                if (charOfP == '*') {
+                    // 当遇到'*'时，有两种情况可以使dp[i][j]为true：
+                    // 1. 忽略'*'（即*匹配空串）：dp[i][j-1]
+                    // 2. 使用'*'匹配当前字符s[i-1]，并继续尝试用这个'*'匹配s中更前面的字符：dp[i-1][j]
+                    dp[i][j] = dp[i][j - 1] || dp[i - 1][j];
+                } else {
+                    // 当字符精确匹配，或模式中是'?'时，当前字符匹配成功
+                    // 并且前面的子串也需匹配成功
+                    if (charOfP == '?' || charOfP == s.charAt(i - 1)) {
+                        dp[i][j] = dp[i - 1][j - 1];
+                    }
+                    // 否则，dp[i][j]保持默认的false
+                }
+            }
+        }
+
+        return dp[sLen][pLen];
     }
 
     /**
@@ -573,6 +851,57 @@ public class RedisServer
          * 5. 集群故障转移等
          */
         Thread.sleep(10);
+
+        activeExpireCycle(false);
+    }
+
+    // 过期键的主动删除
+    public static void activeExpireCycle(boolean flag) {
+        /**
+         * 1. 要控制这个函数需要跑多久
+         * 2. 要控制删除的键的数量
+         */
+
+        // 设置函数最多运行50ms, 删除键的数量最多为10000个
+        long endTime = System.currentTimeMillis() + 50;
+        long maxSum = 10000;
+
+        // 快模式
+        if (flag){
+            endTime = System.currentTimeMillis() + 10;
+            maxSum = 1000;
+        }
+        // 统计删除key的数量
+        long sum = 0;
+
+        for (RedisDB redisDB : redisDB){
+            // 统计key的数量
+            long dbSize = redisDB.dict.getDictSize();
+            if (dbSize == 0){
+                continue;
+            }
+
+
+            for (Map.Entry<String, Long> entry : redisDB.expires.ht[0].entrySet()) {
+                String key = entry.getKey();
+                long expireTime = entry.getValue();
+
+                // 判断是否过期
+                if (expireTime <= System.currentTimeMillis()){
+                    RedisObject redisObject = redisDB.dict.getRedisObject(key);
+                    System.out.println("过期键主动淘汰key: " + key + " value: " + (redisObject == null ? "null" : redisObject));
+
+                    redisDB.dict.remove(key);
+                    redisDB.expires.remove(key);
+                    sum ++;
+                }
+                // 如果过期时间到了或者删除键的数量到达最大值那么就直接返回
+                if (System.currentTimeMillis() >= endTime || sum >= maxSum){
+                    return;
+                }
+            }
+        }
+
     }
 
     /**
