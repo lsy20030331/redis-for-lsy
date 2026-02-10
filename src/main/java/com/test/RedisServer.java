@@ -5,6 +5,7 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.WatchKey;
 import java.util.*;
 import java.util.List;
 
@@ -44,6 +45,15 @@ public class RedisServer
         public Dict<RedisObject> dict = new Dict();
         // 存储键值对过期时间
         public Dict<Long> expires = new Dict();
+        // 数据库的索引
+        public int id;
+
+        // 表示redisDB所对应的客户端以及客户端监控的key
+        public List<WatchedKeyClient> watched_keys = new ArrayList<>();
+        public static class WatchedKeyClient{
+            RedisClient redisClient;
+            String key;
+        }
     }
 
     // 字典
@@ -166,6 +176,25 @@ public class RedisServer
         boolean write;  // 是否可写
         boolean accept;  // 是否接收连接
 
+        /**
+         * 客户端状态
+         * 0: slave
+         * 1: master
+         * 2: slave monitor
+         * 3: multi 事务中 $$$
+         * 4: blocked
+         * 5: watched key modified $$$
+         */
+        int flags = 0;
+        Multi.MultiState multiState;
+
+        // 当前这个客户端监控的键
+        List<WatchedKey> watched_keys = new ArrayList<>();
+
+        public static class WatchedKey{
+            String key; // 代表监控的哪个key
+            int db; // 表示第几号数据库
+        }
 
         // 将ByteBuffer的数据追加到queryBuf中
         public void appendToQueryBuf(ByteBuffer buffer){
@@ -539,10 +568,23 @@ public class RedisServer
         if("command".equalsIgnoreCase(redisRequest.command)){
             return "OK";
         }
-        String key = redisRequest.args.get(0);
+        String key = null;
+        if (redisRequest.args.size() > 0){
+            key = redisRequest.args.get(0);
+        }
+        String command = redisRequest.command;
+
+        // 如果当前正在事务状态中并且命令不是控制事务本身的命令，则加入事务队列
+        if (redisClient.flags == 3 &&
+                !command.equalsIgnoreCase(Multi.MULTI) && !command.equalsIgnoreCase(Multi.DISCARD) &&
+                !command.equalsIgnoreCase(Multi.WATCH) && !command.equalsIgnoreCase(Multi.EXEC)) {
+            Multi.queueMultiCommand(redisClient, redisRequest);
+            return "OK";
+        }
 
         // 内存淘汰策略
         if (maxmemory > 0){
+            // 每次set的时候都要检查内存
             int retval = freeMemoryIfNeeded();
             if (retval == -1 && isCmdDenyoom(redisRequest.command)){
                 // 等于-1代表失败
@@ -598,7 +640,7 @@ public class RedisServer
                 }
                 // LRU策略
                 if (maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU || maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU){
-                    // 从一批sample中选取IDEL最长的key
+                    // 从一批sample中选取IDEL最长的key(IDEL = now - lru), IDEL越大代表越久没有被使用
                     int sampleCount = 5; // 采样数量
                     String bestKey = null; // 最佳键
                     long maxIDEL = -1;  // 最大IDEL(
@@ -692,7 +734,7 @@ public class RedisServer
         return "set".equalsIgnoreCase(command) || "setnx".equalsIgnoreCase(command);
     }
 
-    private static Object call(RedisClient redisClient, RedisRequest redisRequest, RedisDB selectedDB, String key) {
+    public static Object call(RedisClient redisClient, RedisRequest redisRequest, RedisDB selectedDB, String key) {
         if ("get".equalsIgnoreCase(redisRequest.command)){
             // String key = redisRequest.args.get(0);
             return lookUpKeyRead(selectedDB, key);
@@ -701,6 +743,7 @@ public class RedisServer
             // 处理set命令
             RedisObject redisObject = new RedisObject(redisRequest.args.get(1));
             redisClient.selectDB.dict.set(redisRequest.args.get(0), redisObject);
+            Multi.touchWatchedKeys(redisClient, redisRequest);
             return "OK";
         }
         if ("select".equalsIgnoreCase(redisRequest.command)){
@@ -781,11 +824,30 @@ public class RedisServer
             }
             return keys.toString();
         }
+        if ("multi".equalsIgnoreCase(redisRequest.command)){
+            // 开启事务
+            return Multi.multi(redisClient);
+        }
+        if ("watch".equalsIgnoreCase(redisRequest.command)){
+            return Multi.watch(redisClient, redisRequest);
+        }
+        if ("unwatch".equalsIgnoreCase(redisRequest.command)){
+            return Multi.unwatch(redisClient);
+        }
+        if ("exec".equalsIgnoreCase(redisRequest.command)){
+            // 执行事务
+            return Multi.exec(redisClient, selectedDB,  key);
+        }
+        if ("discard".equalsIgnoreCase(redisRequest.command)){
+            return Multi.discard(redisClient);
+        }
         return "ERR unknown command '" + redisRequest.command + "'";
     }
 
     public static boolean isMatch(String s, String p) {
+        // s表示被匹配的字符串str
         int sLen = s.length();
+        // p表示匹配字符串s*
         int pLen = p.length();
 
         // dp[i][j] 表示：s 的前 i 个字符是否与 p 的前 j 个字符匹配
