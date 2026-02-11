@@ -171,6 +171,8 @@ public class RedisServer
         // ===== 非redis数据结构 =====
         Object returnValue; // 返回值
         SocketChannel channel; // NIO连接
+        // 双向记录表示订阅哪些channel
+        List<String> subscribedChannels = new ArrayList<>();
 
         boolean read;  // 是否可读
         boolean write;  // 是否可写
@@ -222,6 +224,17 @@ public class RedisServer
                 int newCapacity = Math.max(queryBuf.length * 2, queryBufLen + bytesToCopy);
                 queryBuf = Arrays.copyOf(queryBuf, newCapacity);
             }
+        }
+    }
+
+    // 订阅频道key表示channel value表示channel对应的redisClient
+    static Map<String, List<RedisClient>> pubsub_Channels = new HashMap<>();
+
+    static class ArrayObject {
+        Object[] elements;
+
+        ArrayObject(Object... elements) {
+            this.elements = elements;
         }
     }
 
@@ -841,6 +854,38 @@ public class RedisServer
         if ("discard".equalsIgnoreCase(redisRequest.command)){
             return Multi.discard(redisClient);
         }
+        if ("subscribe".equalsIgnoreCase(redisRequest.command)){
+            // 订阅功能
+            for (String arg : redisRequest.args) {
+                // 添加channel到redisClient中
+                redisClient.subscribedChannels.add(arg);
+                List<RedisClient> clientList = pubsub_Channels.computeIfAbsent(arg, k -> new ArrayList<>());
+                // 添加当前客户端到订阅者
+                if (!clientList.contains(redisClient)){
+                    clientList.add(redisClient);
+                }else {
+                    return "ERR already subscribed";
+                }
+            }
+            return new ArrayObject("subscribe", redisRequest.args.get(0), 1);
+        }
+        if ("publish".equalsIgnoreCase(redisRequest.command)){
+            // 发布功能
+            String channel = redisRequest.args.get(0);
+            String message = redisRequest.args.get(1);
+            List<RedisClient> redisClients = pubsub_Channels.get(channel);
+            for (RedisClient client : redisClients) {
+                client.returnValue = message;
+                client.write = true;
+
+                // 注册可写事件
+                SelectionKey selectionKey = client.channel.keyFor(selector);
+                selectionKey.interestOps(selectionKey.interestOps() | SelectionKey.OP_WRITE);
+            }
+
+            // 返回收到消息的客户端数
+            return Long.valueOf(redisClients.size()).toString();
+        }
         return "ERR unknown command '" + redisRequest.command + "'";
     }
 
@@ -898,6 +943,18 @@ public class RedisServer
     }
 
     private static void closeClient(SocketChannel socketChannel, SelectionKey key, RedisClient redisClient) throws IOException {
+        // 发布订阅的清除
+        // 首先从redisClient中获取自己订阅了哪些频道
+        List<String> subscribedChannels = redisClient.subscribedChannels;
+        if (redisClient.subscribedChannels != null && redisClient.subscribedChannels.size() > 0) {
+            for (String channelName : subscribedChannels){
+                // 遍历这些频道的名称并清除list中的对应的redisClient
+                List<RedisClient> redisClients = pubsub_Channels.get(channelName);
+                if (redisClients != null && redisClients.size() > 0) {
+                    redisClients.remove(redisClient);
+                }
+            }
+        }
         socketChannel.close();
         clientsMap.remove(key);
         clients.remove(redisClient);
