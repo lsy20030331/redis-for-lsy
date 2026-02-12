@@ -5,7 +5,6 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.WatchKey;
 import java.util.*;
 import java.util.List;
 
@@ -198,6 +197,12 @@ public class RedisServer
             int db; // 表示第几号数据库
         }
 
+        BlockingState bpop;
+        public static class BlockingState {
+            long timeout; // 超时时间
+            Set<String> keys = new HashSet<>(); // 阻塞的key
+        }
+
         // 将ByteBuffer的数据追加到queryBuf中
         public void appendToQueryBuf(ByteBuffer buffer){
             // 切换到读模式(将指针切换到起点从头开始读)
@@ -230,9 +235,11 @@ public class RedisServer
     // 订阅频道key表示channel value表示channel对应的redisClient
     static Map<String, List<RedisClient>> pubsub_Channels = new HashMap<>();
 
+    // 数组对象
     static class ArrayObject {
         Object[] elements;
 
+        // 表示任意数量的参数
         ArrayObject(Object... elements) {
             this.elements = elements;
         }
@@ -450,6 +457,9 @@ public class RedisServer
             client.outBuf = RespUtil.formatError(status.getMessage()); // -ERR...
         }else if (client.returnValue instanceof ErrorObject){
             client.outBuf = RespUtil.formatError(((ErrorObject) client.returnValue).message);
+        }else if (client.returnValue instanceof ArrayObject) {
+            ArrayObject retValue = (ArrayObject) client.returnValue;
+            client.outBuf = RespUtil.formatArray(retValue.elements);
         }
 
         // ================================================
@@ -529,16 +539,19 @@ public class RedisServer
                 }catch (Exception e){
                     result = new ErrorObject("Error Args or Command, Please check your Command!");
                 }
-                // 标记回复状态
-                client.returnValue = result;
-                client.write = true;
+                // 如果有返回值才注册写事件
+                if (result != null) {
+                    // 标记回复状态
+                    client.returnValue = result;
+                    client.write = true;
 
-                // 注册写事件
-                SelectionKey key = client.channel.keyFor(selector);
-                // 叠加事件(让一个连接具备多种状态)
-                // eg: 为了不丢失之前事件的状态，需要使用位运算叠加
-                // 如果客户端在发完第一个指令后紧接着发了第二个指令，服务器就会因为不再关注“读”事件而完全听不到，导致请求丢失或延迟
-                key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+                    // 注册写事件
+                    SelectionKey key = client.channel.keyFor(selector);
+                    // 叠加事件(让一个连接具备多种状态)
+                    // eg: 为了不丢失之前事件的状态，需要使用位运算叠加
+                    // 如果客户端在发完第一个指令后紧接着发了第二个指令，服务器就会因为不再关注“读”事件而完全听不到，导致请求丢失或延迟
+                    key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+                }
             } else if (processed == 0) {
                 break; // 数据不完整，等待下次读取
             } else {
@@ -886,7 +899,122 @@ public class RedisServer
             // 返回收到消息的客户端数
             return Long.valueOf(redisClients.size()).toString();
         }
+        if ("lpush".equalsIgnoreCase(redisRequest.command)){
+            RedisObject redisObject = selectedDB.dict.getRedisObject(key);
+            if (redisObject != null && redisObject.type != RedisConstants.REDIS_LIST){
+                return new ErrorObject("WRONG TYPE Operation against a key holding the wrong kind of value");
+            }
+            if (redisObject == null){
+                ZipList zipList = new ZipList();
+                redisObject = new RedisObject(zipList);
+                redisObject.type = RedisConstants.REDIS_LIST;
+                redisObject.encoding = RedisConstants.REDIS_ENCODING_ZIPLIST;
+                selectedDB.dict.set(key, redisObject);
+            }
+//            if (redisObject == null){
+//                LinkedList zipList = new LinkedList();
+//                redisObject = new RedisObject(zipList);
+//                redisObject.type = RedisConstants.REDIS_LIST;
+//                redisObject.encoding = RedisConstants.REDIS_ENCODING_LINKEDLIST;
+//                selectedDB.dict.set(key, redisObject);
+//            }
+            int count = 0;
+            for (String value : redisRequest.args.subList(1, redisRequest.args.size())) {
+                listTypePush(redisObject, value, true);
+                count ++;
+            }
+            return Long.valueOf(count).toString();
+        }
+        if ("lrange".equalsIgnoreCase(redisRequest.command)){
+            long start = Long.parseLong(redisRequest.args.get(1));
+            long end = Long.parseLong(redisRequest.args.get(2));
+
+            RedisObject redisObject = selectedDB.dict.getRedisObject(key);
+            if (redisObject != null && redisObject.type != RedisConstants.REDIS_LIST){
+                return new ErrorObject("WRONG TYPE Operation against a key holding the wrong kind of value");
+            }
+            if (redisObject == null){
+                return new ArrayObject();
+            }
+            if (redisObject.encoding == RedisConstants.REDIS_ENCODING_ZIPLIST){
+                ZipList zipList = (ZipList) redisObject.value;
+                List<String> list = zipList.range((int)start, (int)end);
+                return new ArrayObject(list);
+            }else if (redisObject.encoding == RedisConstants.REDIS_ENCODING_LINKEDLIST){
+                LinkedList linkedList = (LinkedList) redisObject.value;
+
+                List<Object> range = new ArrayList<>();
+                // 如果是-1那么就代表查询整个linkedList
+                if (end == -1){
+                    end = linkedList.size() - 1;
+                }
+                for (int i = 0; i < linkedList.size(); i ++ ){
+                    // 在start和end之间
+                    if (i >= start && i <= end){
+                        Object linkedListValue = linkedList.get(i);
+                        range.add(linkedListValue);
+                    }
+                }
+                // System.out.println(range.toArray());
+                return new ArrayObject(range.toArray());
+            }
+        }
+        if ("blpop".equalsIgnoreCase(redisRequest.command)){
+            String s = redisRequest.args.get(1);
+            long timeout = Long.parseLong(s);
+            RedisObject redisObject = selectedDB.dict.getRedisObject(key);
+
+            if (redisObject != null && redisObject.type != RedisConstants.REDIS_LIST){
+                return new ErrorObject("WRONG TYPE Operation against a key holding the wrong kind of value");
+            }
+
+            if (redisObject != null){
+
+            }
+            if (redisObject == null){
+                blockForKeys(redisClient, key, timeout);
+                return null;
+            }
+        }
         return "ERR unknown command '" + redisRequest.command + "'";
+    }
+
+    private static void blockForKeys(RedisClient redisClient, String key, long timeout) {
+        redisClient.flags = 4;
+        redisClient.bpop = new RedisClient.BlockingState();
+        redisClient.bpop.timeout = System.currentTimeMillis() + timeout * 1000;
+        redisClient.bpop.keys.add(key);
+
+    }
+
+    private static void listTypePush(RedisObject redisObject, String value, boolean isHead) {
+        // 如果zipList超过了长度那么就转换为LinkedList
+        listTypeConversion();
+        if (redisObject.encoding == RedisConstants.REDIS_ENCODING_ZIPLIST){
+            // 如果类型是压缩列表
+            ZipList zipList = (ZipList) redisObject.value;
+            if (isHead){
+                zipList.insertFromHead(value);
+            }else {
+                zipList.insertFromTail(value);
+            }
+
+        }else if (redisObject.encoding == RedisConstants.REDIS_ENCODING_LINKEDLIST){
+            // 如果类型是链表
+            LinkedList linkedList = (LinkedList) redisObject.value;
+            if (isHead){
+                // 直接插入头部
+                linkedList.add(0,  value);
+            }else {
+                // 从尾部插入
+                linkedList.add(value);
+            }
+        }else{
+            System.out.println("listTypePush error");
+        }
+    }
+
+    private static void listTypeConversion() {
     }
 
     public static boolean isMatch(String s, String p) {
@@ -973,6 +1101,25 @@ public class RedisServer
         Thread.sleep(10);
 
         activeExpireCycle(false);
+        clientsCron();
+    }
+
+    /**
+     * 解决客户端阻塞函数
+     */
+    private static void clientsCron() {
+        for (RedisClient redisClient : clients){
+            if (redisClient.flags == 4){
+                if (redisClient.bpop != null && redisClient.bpop.timeout <= System.currentTimeMillis()){
+                    // 如果已经超时了那么就注册写事件
+                    redisClient.write = true;
+                    redisClient.returnValue = null;
+
+                    SelectionKey selectionKey = redisClient.channel.keyFor(selector);
+                    selectionKey.interestOps(selectionKey.interestOps() | SelectionKey.OP_WRITE);
+                }
+            }
+        }
     }
 
     // 过期键的主动删除 新版, 更贴合redis源码
