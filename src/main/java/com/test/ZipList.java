@@ -24,7 +24,7 @@ public class ZipList {
         // 初始化头部：zlbytes(4) + zltail(4) + zllen(2) + zlend(1)
         data = new byte[11];
         totalLength = 11; // 4+4+2+1
-        tailOffset = 11;  // zltail 指向 zlend 的位置
+        tailOffset = 10;  // zltail 指向 zlend 的位置
         entryCount = 0;
 
         // 设置 zlbytes, zltail, zllen
@@ -65,7 +65,7 @@ public class ZipList {
     public void insertFromTail(String s) {
         // 1. 计算空间：不再需要额外的 +1 给结束符 '0'
         // prevlen(4) + encoding(2) + data(s.length)
-        int entryLength = 4 + 2 + s.length();
+        int entryLength = 4 + 2 + s.getBytes().length;
         int requiredSpace = entryLength;
 
         // 2. 扩容逻辑
@@ -101,9 +101,9 @@ public class ZipList {
         data[pos] = (byte) 0xFF;
 
         // 7. 更新元数据
-        tailOffset = entryStartPos; // 指向当前 Entry 开头
-        totalLength = pos + 1;      // 总长度包含最后的 zlend
-        entryCount++;
+        this.tailOffset = entryStartPos; // 指向当前 Entry 开头
+        this.totalLength = pos + 1;      // 总长度包含最后的 zlend
+        this.entryCount++;
 
         setZlbytes(totalLength);
         setZltail(tailOffset);
@@ -117,7 +117,8 @@ public class ZipList {
     public void insertFromHead(String s) {
         // 1. 计算新节点所需空间（包含 prevlen + encoding + entry-data）
         int entryLength = calculateEntryLength(s);
-        int requiredSpace = entryLength + 4; // prevlen(4) + entry
+        // 使用字符串的字节数组计算字节长度
+        int requiredSpace = 4 + 2 + s.getBytes().length;; // prevlen(4) + entry
 
         // 2. 计算当前 ziplist 长度（用于后续内存移动）
         int currentLength = totalLength;
@@ -156,9 +157,17 @@ public class ZipList {
             writePrevlen(data, 10 + requiredSpace, requiredSpace);
         }
 
+
         // 6. 更新头部信息
         totalLength += requiredSpace;
-        tailOffset += requiredSpace; // 表尾偏移量增加
+        if (entryCount == 0) {
+            // 第一次插入，尾部偏移量就是起始点 10
+            tailOffset = 10;
+        } else {
+            // 后续插入，旧的尾巴整体向后挪了 requiredSpace 字节
+            tailOffset += requiredSpace;
+        }
+        data[tailOffset + requiredSpace] = (byte) 0XFF;
         entryCount++;
 
         setZlbytes(totalLength);
@@ -169,7 +178,7 @@ public class ZipList {
     // 计算字符串元素所需的长度
     private int calculateEntryLength(String s) {
         // 实际中需要根据字符串长度计算，这里简化
-        return s.length() + 2; // 假设 encoding 占2字节
+        return s.getBytes().length + 2; // 假设 encoding 占2字节
     }
 
     // 写入 prevlen
@@ -185,7 +194,7 @@ public class ZipList {
 
     // 写入 encoding (固定两个字节的长度)
     private int writeEncoding(byte[] data, int pos, String s) {
-        int len = s.length();
+        int len = s.getBytes().length;
         // 使用大端序存储长度
         // 提取int最高的8位(2位encoding只能获得int的16位)
         data[pos] = (byte) (len >> 8);
@@ -205,27 +214,30 @@ public class ZipList {
 
     // 从尾部遍历
     public String getFromTail(int index) {
-        // 1. 初始位置修正：tailOffset 已经指向了最后一个 Entry 的开头
-        int pos = tailOffset;
-
-        // 2. 如果索引超出范围或列表为空，直接返回 null
-        if (entryCount == 0 || index >= entryCount) {
+        // 1. 检查边界
+        if (entryCount == 0 || index < 0 || index >= entryCount) {
             return null;
         }
 
-        // 3. 循环向前跳转
-        // 如果 index 为 0，不进入循环，直接解析当前 tailOffset 指向的最后一个元素
+        // 2. 从表尾偏移量开始（最后一个节点的开头）
+        int pos = tailOffset;
+
+        // 3. 循环向前“跳跃”
         for (int i = 0; i < index; i++) {
-            // 从当前节点的起始位置读取 prevlen，跳转到上一个节点的起始位置
+            // 【核心修正】读取当前节点开头的 4 个字节，这才是记录“前一跳距离”的地方
+            // 注意：这里传的是 pos，而不是 pos-4
             int prevlen = readPrevlen(data, pos);
-            if (prevlen == 0 && i < index) {
-                // 如果读到 prevlen 为 0 但还没跳到目标 index，说明已经到头了
+
+            if (prevlen == 0) {
+                // 如果 prevlen 为 0，说明已经跳到第一个节点了，无法再往前
                 break;
             }
+
+            // 向上移动到前一个节点的开头
             pos = pos - prevlen;
         }
 
-        // 4. 解析当前 pos 指向的节点内容
+        // 4. 解析该位置的 Entry
         return parseEntryAtPos(data, pos);
     }
 
@@ -247,8 +259,8 @@ public class ZipList {
 
     // 使用 ByteBuffer 的替代实现
     private int readPrevlen(byte[] data, int pos) {
-        // 读取data数组从pos-4字节开始读取4个字节并按大端序转化为int
-        return ByteBuffer.wrap(data, pos-4, 4)
+        // 读取data数组从pos字节开始读取4个字节并按大端序转化为int
+        return ByteBuffer.wrap(data, pos, 4)
                 .order(ByteOrder.BIG_ENDIAN)
                 .getInt();
     }
@@ -308,7 +320,7 @@ public class ZipList {
         ziplist.print();
         List<String> range = ziplist.range(0, 3);
 
-        // System.out.println("Range: " + range.toString());
-        // System.out.println((byte)(200) & 0xFF);
+//         System.out.println("Range: " + range.toString());
+//         System.out.println((byte)(200) & 0xFF);
     }
 }

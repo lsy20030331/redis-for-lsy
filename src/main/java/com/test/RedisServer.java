@@ -939,7 +939,7 @@ public class RedisServer
             if (redisObject.encoding == RedisConstants.REDIS_ENCODING_ZIPLIST){
                 ZipList zipList = (ZipList) redisObject.value;
                 List<String> list = zipList.range((int)start, (int)end);
-                return new ArrayObject(list);
+                return new ArrayObject(list.toArray());
             }else if (redisObject.encoding == RedisConstants.REDIS_ENCODING_LINKEDLIST){
                 LinkedList linkedList = (LinkedList) redisObject.value;
 
@@ -964,17 +964,32 @@ public class RedisServer
             long timeout = Long.parseLong(s);
             RedisObject redisObject = selectedDB.dict.getRedisObject(key);
 
+            Object rtObject = null;
+
             if (redisObject != null && redisObject.type != RedisConstants.REDIS_LIST){
                 return new ErrorObject("WRONG TYPE Operation against a key holding the wrong kind of value");
             }
 
-            if (redisObject != null){
-
+            if (redisObject != null) {
+                if (redisObject.encoding == RedisConstants.REDIS_ENCODING_ZIPLIST) {
+                    ZipList zipList = (ZipList) redisObject.value;
+                    String fromTail = zipList.getFromTail(0);
+                     rtObject = fromTail;
+                } else if (redisObject.encoding == RedisConstants.REDIS_ENCODING_LINKEDLIST) {
+                    LinkedList linkedList = (LinkedList) redisObject.value;
+                    if (linkedList.size() != 0) {
+                        Object first = linkedList.removeFirst();
+                        rtObject = first;
+                    }
+                } else {
+                    return new RedisServer.ErrorObject("WRONGTYPE Operation against a key holding the wrong kind of value");
+                }
             }
-            if (redisObject == null){
+            if (rtObject == null){
                 blockForKeys(redisClient, key, timeout);
                 return null;
             }
+            return rtObject;
         }
         return "ERR unknown command '" + redisRequest.command + "'";
     }
@@ -1117,6 +1132,9 @@ public class RedisServer
 
                     SelectionKey selectionKey = redisClient.channel.keyFor(selector);
                     selectionKey.interestOps(selectionKey.interestOps() | SelectionKey.OP_WRITE);
+
+                    redisClient.flags = 0;
+                    redisClient.bpop = null;
                 }
             }
         }
