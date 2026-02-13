@@ -938,8 +938,9 @@ public class RedisServer
             }
             if (redisObject.encoding == RedisConstants.REDIS_ENCODING_ZIPLIST){
                 ZipList zipList = (ZipList) redisObject.value;
-                List<String> list = zipList.range((int)start, (int)end);
-                return new ArrayObject(list.toArray());
+                List<String> range = zipList.range((int)start, (int)end);
+                Collections.reverse(range);
+                return new ArrayObject(range.toArray());
             }else if (redisObject.encoding == RedisConstants.REDIS_ENCODING_LINKEDLIST){
                 LinkedList linkedList = (LinkedList) redisObject.value;
 
@@ -956,6 +957,7 @@ public class RedisServer
                     }
                 }
                 // System.out.println(range.toArray());
+                Collections.reverse(range);
                 return new ArrayObject(range.toArray());
             }
         }
@@ -973,7 +975,7 @@ public class RedisServer
             if (redisObject != null) {
                 if (redisObject.encoding == RedisConstants.REDIS_ENCODING_ZIPLIST) {
                     ZipList zipList = (ZipList) redisObject.value;
-                    String fromTail = zipList.getFromTail(0);
+                    String fromTail = zipList.pop();
                      rtObject = fromTail;
                 } else if (redisObject.encoding == RedisConstants.REDIS_ENCODING_LINKEDLIST) {
                     LinkedList linkedList = (LinkedList) redisObject.value;

@@ -241,6 +241,51 @@ public class ZipList {
         return parseEntryAtPos(data, pos);
     }
 
+    public String pop(){
+        if (entryCount == 0){
+            return null;
+        }
+        int targetPos = tailOffset;
+
+        String result = parseEntryAtPos(data, targetPos);
+
+        // 获取该节点的长度
+        // 结构：prevlen(4) + encoding(2) + dataLen
+        int dataLen = ((data[targetPos + 4] & 0xFF) << 8) | (data[targetPos + 5] & 0xFF);
+        int entryLen = 4 + 2 + dataLen;
+
+        // 将 zlend (0xFF) 挪到当前节点起始处
+        data[targetPos] = (byte) 0xFF;
+
+        // 更新元数据
+        if (entryCount == 1) {
+            // 删掉最后一个元素后，回归初始状态
+            tailOffset = 10;
+            totalLength = 11;
+        } else {
+            // 还有剩余元素，tailOffset 需要回溯到上一个节点的开头
+            // 我们读取刚刚被删掉位置的 prevlen，它记录了上一个节点的长度
+            int prevLen = readPrevlen(data, targetPos);
+            tailOffset = targetPos - prevLen;
+            totalLength -= entryLen;
+        }
+
+        entryCount--;
+
+        // 同步更新 Header
+        setZlbytes(totalLength);
+        setZltail(tailOffset);
+        setZllen(entryCount);
+
+        // 缩容优化：如果实际数据长度远小于数组容量，进行瘦身
+        if (data.length > totalLength + 100) { // 比如多出 100 字节就缩容
+            byte[] newData = new byte[totalLength];
+            System.arraycopy(data, 0, newData, 0, totalLength);
+            this.data = newData;
+        }
+        return result;
+    }
+
     // 修正解析逻辑：现在 pos 确切地指向 Entry 的开头 (prevlen)
     private String parseEntryAtPos(byte[] data, int pos) {
         // 1. 跳过 prevlen (4字节) 得到 encoding 的位置
